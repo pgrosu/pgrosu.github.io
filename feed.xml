@@ -1,0 +1,2502 @@
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><generator uri="https://jekyllrb.com/" version="4.3.2">Jekyll</generator><link href="https://pgrosu.github.io/feed.xml" rel="self" type="application/atom+xml" /><link href="https://pgrosu.github.io/" rel="alternate" type="text/html" hreflang="en" /><updated>2023-11-27T16:45:10-05:00</updated><id>https://pgrosu.github.io/feed.xml</id><title type="html">blank</title><subtitle>A little about me along with some deep dives to help others.
+</subtitle><entry><title type="html">ShallowConsensus</title><link href="https://pgrosu.github.io/blog/2023/shallowconsensus/" rel="alternate" type="text/html" title="ShallowConsensus" /><published>2023-11-14T10:12:00-05:00</published><updated>2023-11-14T10:12:00-05:00</updated><id>https://pgrosu.github.io/blog/2023/shallowconsensus</id><content type="html" xml:base="https://pgrosu.github.io/blog/2023/shallowconsensus/"><![CDATA[<p>In the previous <a href="../shallowvariant">blog</a> we applied the concepts of a neural network to genomics via a variant caller named ShallowVariant.  Here we will build a simpler variation of <a href="https://github.com/google/deepconsensus">Google’s DeepConsensus</a><d-cite key="baid2023deepconsensus"></d-cite> using an encoder-only transformer, to illustrate a practical example in the area of Genomics with Machine Learning.</p>
+
+<h2 id="our-goal">Our Goal</h2>
+
+<p>Sometimes when a sequencer provides reads, we might have gaps between the sequences out of which we want to build a consensus sequence (such as de novo sequence assembly).  We want to train a transformer (encoder-only) to be able to take such sequences, and fill in the gaps correctly.  Our approach should be much smaller and faster than actually searching the genome for the correct contextual subsequence.</p>
+
+<h2 id="downloading-the-data">Downloading the Data</h2>
+
+<p>The first step is to download the necessary file:</p>
+
+<ol>
+  <li>The only file that is necessary is the the sequence of one gene, which in this case is <a href="https://www.ncbi.nlm.nih.gov/nuccore/OQ235086.1?report=fasta">BRCA1</a> (<em><ins>BReast CAncer gene 1</ins></em> coding sequence).<d-footnote>Homo sapiens isolate OC-10 mutant BRCA1 protein (BRCA1) gene, partial cds: <a href="https://www.ncbi.nlm.nih.gov/nuccore/OQ235086.1?report=fasta">https://www.ncbi.nlm.nih.gov/nuccore/OQ235086.1?report=fasta</a></d-footnote>  The program can work and will improve the training with more sequences, but we wanted to keep the example simple.</li>
+</ol>
+
+<p>This file is sufficient to get us started.</p>
+
+<h2 id="what-is-a-transformer">What is a Transformer?</h2>
+
+<p>The idea of a transformer was first proposed by Vaswani, et. al. in a Google paper called <em>Attention is All you Need</em> mainly for the application of language translation.<d-cite key="vaswani2023attention"></d-cite>  The transformer architecture is core to ChatGPT, but has emerged to have useful properties that can be applied to other fields as well, such as genomics (where DNA is both a language and a vocabulary).  The general architecture is the following:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/transformer_architecture.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 1: The transformer architecture showing the encoder and decoder.
+</div>
+
+<p>Before diving into the transformer architecture, it provides three major benefits over the previous approach in machine translation (<a href="https://machinelearningmastery.com/an-introduction-to-recurrent-neural-networks-and-the-math-that-powers-them/">Recurrent Neural Networks</a>):</p>
+
+<ol>
+  <li>Transformers are highly parallelizable.</li>
+  <li>Transformers work well with long sequences.</li>
+  <li>Transformers are able to capture context (affinity) among words in a sentence, through a method called <em>attention</em>.</li>
+</ol>
+
+<p>The high level view of a transformer is the following:</p>
+
+<ol>
+  <li>The Encoder learns a language from two elements:
+    <ul>
+      <li>The vocabulary of a language.</li>
+      <li>The affinities of words to other words based on sentences from a corpus.</li>
+      <li>Based on these it is able to be given a sentence, and predict the next word in the sentence.</li>
+    </ul>
+  </li>
+  <li>The Decoder is trained in a similar way, but it is trained so that the correct predicted word from the Encoder is the same one in a translated language.</li>
+</ol>
+
+<p>Let us dive a little bit deeper in the Encoder, as the Decoder has a similar design and for our implementation of <em>ShallowConsensus</em> we only need the Encoder for now.</p>
+
+<h2 id="embedding-the-vocabulary">Embedding the Vocabulary</h2>
+
+<p>Computers prefer to work with numbers, especially when performing any mathematical analysis across a dataset.  In our case we will be using DNA to encode them as numbers, and with only 4 bases (A, T, G and C) sliced at different short subsequence lengths this should be more trivial than the vocabulary of the English language.  These come in the form of a vector of any desirable size, where each word (base or subsequence) becomes encoded as an unique series of numbers representing it.  Thus a matrix of such vectors becomes the word embedding of a vocabulary.  These numbers can change as the training is performed and words that display close association with each other, will have a similar vector direction (or <a href="https://www.learndatasci.com/glossary/cosine-similarity/"><em>cosine similarity</em></a>).</p>
+
+<p>Let’s start with how we used our gene (BRCA1) to begin coding the Encoder.  I will jump into code as soon as one aspect is covered and continue going back-and-forth to illustrate the practical application of the theory.</p>
+
+<d-code block="" language="python">
+# Here we used a file called genome.txt to store our BRCA1 sequence
+\$ cat genome.txt
+GGTGTCCACCCAATTGTGGTTGTGCAGCCAGATGCCTGGACAGAGGACAATGGCTTCCATGCAATTGGGC
+AGATGTGTGAGGCACCTGTGGTGACCCGAGAGTGGGTGTTGGATAG
+\$
+</d-code>
+
+<p>Since the encoder $\text{–}$ just like a human $\text{–}$ will be able to learn better with more text, we will provide multiple copies of the BRCA1 sequence in the <code class="language-plaintext highlighter-rouge">genome.txt</code> file.  That will look something like this $\text{–}$ though a more reprentative approach would be the sequence of the whole genome:</p>
+
+<d-code block="" language="python">
+# Here we used a file called genome.txt to store our BRCA1 sequence
+\$ cat genome.txt
+GGTGTCCACCCAATTGTGGTTGTGCAGCCAGATGCCTGGACAGAGGACAATGGCTTCCATGCAATTGGGC
+AGATGTGTGAGGCACCTGTGGTGACCCGAGAGTGGGTGTTGGATAG
+GGTGTCCACCCAATTGTGGTTGTGCAGCCAGATGCCTGGACAGAGGACAATGGCTTCCATGCAATTGGGC
+AGATGTGTGAGGCACCTGTGGTGACCCGAGAGTGGGTGTTGGATAG
+GGTGTCCACCCAATTGTGGTTGTGCAGCCAGATGCCTGGACAGAGGACAATGGCTTCCATGCAATTGGGC
+AGATGTGTGAGGCACCTGTGGTGACCCGAGAGTGGGTGTTGGATAG
+GGTGTCCACCCAATTGTGGTTGTGCAGCCAGATGCCTGGACAGAGGACAATGGCTTCCATGCAATTGGGC
+AGATGTGTGAGGCACCTGTGGTGACCCGAGAGTGGGTGTTGGATAG
+...
+\$
+</d-code>
+
+<p>Next we will load the data into Python as follows $\text{–}$ where again we will be using PyTorch:</p>
+
+<d-code block="" language="python">
+# This will be populated with the genomic sequences
+genome = ''
+
+# Loading in the gene sequence
+with open('genome.txt', 'r', encoding='utf-8') as file:
+    for line in file:
+        # Removing the newline character from the genome, as it is unnecessary noise
+        genome = genome + line.replace("\n", "")
+
+def construct_dna_vocabulary( sequence, splice_size ):
+
+    subsequences = []
+
+    # Shift and also sub-select up to size of the splice_size
+    for offset in range( 0, splice_size ):
+        for i in range( offset, len(sequence) ):
+
+            subsequences.append( sequence[ i:(i+splice_size) ] )
+            subsequences.append( sequence[ i:(i+offset) ] )
+
+    # Collect only non-empty entries
+    non_empty_vocabulary_entries = []
+    
+    for i in subsequences:
+        if len( i.strip() ) &gt; 0:
+            non_empty_vocabulary_entries.append( i.strip() )
+    
+    vocabulary = sorted( list( set( non_empty_vocabulary_entries ) ) )
+    
+    return vocabulary
+
+# Construct a vocabulary sliced in sizes of 8 letters or less from the BRCA1 gene
+GENOME_SPLICE_SIZE = 8
+dna_vocabulary = construct_dna_vocabulary( genome, GENOME_SPLICE_SIZE )
+dna_vocabulary_length = len( dna_vocabulary )
+
+
+print("The vocabulary of DNA:")
+print( dna_vocabulary )
+</d-code>
+
+<p>The output will be as follows:</p>
+
+<d-code block="" language="python">
+The vocabulary of DNA:
+['A', 'AA', 'AAT', 'AATG', 'AATGG', 'AATGGC', 'AATGGCT', 'AATGGCTT', ... ]
+</d-code>
+
+<p>Notice how in this list of our DNA vocabulary, each subsequence would have an index.  We can use that to begin converting our sequence to an equivalent numerical sequence of indices, or vice versa.  For that we need a few functions, and variables:</p>
+
+<d-code block="" language="python">
+def dna_vocabulary_to_index_mapping( vocabulary ):
+    
+    index = 0
+    
+    dna_vocabulary_to_index_dictionary = {}
+    
+    for subsequence in vocabulary:
+         dna_vocabulary_to_index_dictionary[ subsequence ] = index
+         index = index + 1
+         
+    return dna_vocabulary_to_index_dictionary
+
+
+def index_to_dna_vocabulary_mapping( vocabulary ):
+    
+    index = 0
+    index_to_dna_vocabulary_dictionary = {}
+    
+    for subsequence in vocabulary:
+         index_to_dna_vocabulary_dictionary[ index ] = subsequence
+         index = index + 1
+         
+    return index_to_dna_vocabulary_dictionary
+
+
+# A dictionary for converting DNA subsequences to indices
+dna_vocabulary_to_index_dictionary = dna_vocabulary_to_index_mapping( dna_vocabulary )
+
+# A dictionary for converting indices to DNA subsequences
+index_to_dna_vocabulary_dictionary = index_to_dna_vocabulary_mapping( dna_vocabulary )
+
+
+def encode_sequence_as_indices( sequence, dna_vocabulary_to_index_dictionary, splice_size ):
+    
+    encoded_sequence = []
+    
+    for i in range( 0, len(sequence) ):
+        encoded_sequence.append( dna_vocabulary_to_index_dictionary[ sequence[ i:(i+splice_size) ] ] )
+       
+    return encoded_sequence
+
+
+
+def decode_indices_into_sequence( indices, index_to_dna_vocabulary_dictionary ):
+    
+    decoded_sequence = ''
+         
+    for index in range(0, len(indices) ):
+        decoded_sequence = decoded_sequence + \
+                           index_to_dna_vocabulary_dictionary[ indices[ index ] ]
+           
+    return decoded_sequence
+</d-code>
+
+<p>As before we will need to split our data into a training and testing group, so we might as well do it now, while still dealing with the input data:</p>
+
+<d-code block="" language="python">
+# Training and testing splits
+TRAINING_SIZE = 0.8
+
+data = torch.tensor( encode_sequence_as_indices( genome, 
+                                                 dna_vocabulary_to_index_dictionary, 
+                                                 GENOME_SPLICE_SIZE ), dtype=torch.long )
+
+last_index_of_training_data = int( TRAINING_SIZE * len( data ) )
+
+training_data = data[ :last_index_of_training_data ]
+
+validation_data = data[ last_index_of_training_data: ]
+</d-code>
+
+<p>Now we have enough to continue with the theory.  From the architecture of the encoder, we still need to embed the bases and subsequences of DNA into some sort of vector.  For that we will be using the <a href="https://pytorch.org/docs/stable/generated/torch.nn.Embedding.html">nn.Embedding</a> function from PyTorch.  This function requires as input the size of the vocabulary, and how long the the vector of each word will be.  For that we will define several variables, or <a href="https://machinelearningmastery.com/difference-between-a-parameter-and-a-hyperparameter/">hyperparameters</a>:</p>
+
+<d-code block="" language="python">
+# Our seed for the random number generator
+torch.manual_seed( 999 )
+
+# The number of groups of sequences we want to 
+# process independently (in parallel)
+batch_size = 8
+
+# If we want to predict the next base, what would 
+# be the minimum sequence length required
+sequence_length_required_for_prediction = 32 
+
+# The number of training iterations (usually longer 
+# is better, but this is a simple example)
+number_of_training_iterations = 200
+
+# After how many iterations do we want to present 
+# the loss, so far of the model
+iteration_interval_to_print_loss = 10
+
+# The learning rate (you have seen before)
+learning_rate = 3e-2
+
+# The number of losses to keep track of
+number_of_losses_to_record = 10
+
+# The granularity of how long the vector of the embedding should be
+size_of_granularity_of_representation = 16 
+
+# Into how many training groups should we split our data, so that
+# the model can learn from multiple perspectives about the data.
+number_of_multiple_heads = 4
+
+# The number of repeated encoders, as we will stack multiple 
+# encoders on top of each other to improve the training of 
+# our model.
+number_of_encoder_blocks = 6
+
+# During rounds of training, what percentage of the nodes in the 
+# neural network can be hidden in order for the others to compensate
+# so that overfitting does not occur.
+dropout = 0.1
+
+# This is the amount by which the feed forward network should expand by
+# during the self-reflecting stage of the encoder
+feed_forward_scaled_expansion = 4
+</d-code>
+
+<p>With the above variables, the embedding can be defined as follows, though we shall see later where in the code it will reside:</p>
+
+<d-code block="" language="python">
+self.dna_embedding_table = nn.Embedding( dna_vocabulary_length, 
+                                         size_of_granularity_of_representation )
+</d-code>
+
+<p>The last step we should consider is the position of each base or subsequence in the indexed embedded sequence while inquiring the encoder.  For that we will be adding to each embedding’s vector positions specifically calculated numbers, which we will define as <a href="https://kikaben.com/transformers-positional-encoding/"><em>positional encoding</em></a>.  We will come back to this idea later, when we will be implementing it.</p>
+
+<p>For now we will keep going up the encoder stack.</p>
+
+<h2 id="ask-in-order-to-learn">Ask In Order to Learn</h2>
+
+<p>Before we get to the next element of the Encoder, we need to understand a bit about how it learns.  Imagine you have the following design:</p>
+
+<ul>
+  <li>You start with a <em><ins>sequence</ins></em>, which is a series of bases or subsequences</li>
+</ul>
+
+<p>You have two neural networks that you will push this sequence through:</p>
+
+<ul>
+  <li>A $Query$ neural network, and</li>
+  <li>A $Key$ neural network</li>
+</ul>
+
+<p>If you perform the following operation, you will get an output for each base or sliced subsequence covering every position of the sequence:</p>
+
+<ul>
+  <li>$Query( Sequence )$ : This will produce an output for all the bases or subsequences</li>
+  <li>$Key( Sequence )$ : This will produce another output for all the bases or subsequences</li>
+</ul>
+
+<p>Nothing is happening yet, because we have not made them interact with each other, which happens next via a dot-product:</p>
+
+<ul>
+  <li>$Query( Sequence ) \cdot Key( Sequence )^T$ : This is the dot product to check for affinities among bases or subsequences.  You can think of this as producing a $Sequence \times Sequence$ matrix of interactions. The keys here are transposed.</li>
+</ul>
+
+<p>This dot-product has all bases (or subsequences) check against all other bases (or subsequences) in the sequence.  If their interaction is strong (i.e. the multiplication and addition produce a large number), then the relationship between one base (or subsequence) and another is strong, otherwise not.  Strong interactions indicate affinities for each other in a data-dependent manner.</p>
+
+<p>Now we have a $|Sequence| \times |Sequence|$ matrix, but what we want is for the sequence to produce us the affinities to across the sequence.  For that we generate the following neural network:</p>
+
+<ul>
+  <li>$Value( Sequence )$ : This will produce an output for all the bases or subsequences</li>
+</ul>
+
+<p>If we take the previous dot-product ($Q \cdot K^T$), and perform a dot-product with $V$, we get which bases (or subsequence) in this sequence we should pay more attention to as compared to others.  This is the <em><ins>attention score</ins></em>!  The actual formula is the following:</p>
+
+\[Attention(Q,K,V) = softmax(\dfrac{Q \cdot K^T}{\sqrt{d_{key}}})V\]
+
+<p>You will notice that we divide by a square root term ($d_{key}$).  That term is the granularity of the key embedding.  This prevents the softmax function from becoming saturated with large values.  The $softmax$ function is there so that we work in the space of probabilities.</p>
+
+<p>The question you might still ask yourself is why does this work, and <em>maybe</em> how it is being achieved?  Keep in mind that these neural networks have weights that are trainable through many iterations:</p>
+
+\[W_{query}*Corpus\\\]
+
+\[W_{key}*Corpus\\\]
+
+\[W_{value}*Corpus\\\]
+
+<p>These weights will be adjusted by the optimizer given how the attention formula is performed. They will maximize based on the expected next word given multiple sequence contexts.  The formulas make them interdependent, and the weights is how their interdependence is adjusted to maximize the expected next output.  Notice also that the whole corpus is being fed, so this then becomes <em>self-attentive</em> to maximize on the same language.</p>
+
+<p>Attention is specified as an <code class="language-plaintext highlighter-rouge">AttentionHead</code> in our code.  Each attention head is implemented as follows in our code:</p>
+
+<d-code block="" language="python">
+class AttentionHead(nn.Module):
+   """ One self-attention head """
+    
+    def __init__(self, head_size):
+        super().__init__()
+
+        self.key = nn.Linear( size_of_granularity_of_representation, 
+                              head_size, bias=False )
+        self.query = nn.Linear( size_of_granularity_of_representation, 
+                                head_size, bias=False )
+        self.value = nn.Linear( size_of_granularity_of_representation, 
+                                head_size, bias=False )
+
+        self.dropout = nn.Dropout( dropout )
+
+
+    def forward(self, bases_or_subsequences ):
+        
+        key = self.key( bases_or_subsequences )
+        query = self.query( bases_or_subsequences ) 
+        affinities = query @ key.transpose(-2,-1) * math.sqrt( key.shape[-1] ) 
+        affinities = F.softmax(affinities, dim=-1) 
+        affinities = self.dropout( affinities )        
+        value = self.value( bases_or_subsequences ) 
+        attention = affinities @ value
+        
+        return attention
+</d-code>
+
+<p>This clearly illustrates how the affinities get adjusted given the input of the sequence.  The $key$ and $query$ neural networks take the base (or subsequence) embeddings, and determine just by the dot product which positioned bases (or subsequences) have the closest affinities.  That gets propagated into the bases/subsequences attention matrix for the this head, through the dot product with the values.  One thing to note regarding our encoder’s prediction behavior is to capture all the sequence information (including future ones).  Thus all bases (and subsequences) beyond our input need to be unmasked during training, as relating to the prediction of the next base.  With a decoder that is not the case.</p>
+
+<p>One other element to show here is the <a href="https://pytorch.org/docs/stable/generated/torch.nn.Dropout.html">dropout</a> function.  This comes from a 2014 paper by Srivastava, et al. from the University of Toronto.<d-cite key="srivastava2014dropout"></d-cite>  $Dropout$ is defined as a fraction denoting how many nodes in a network should be hidden in order for the others to compensate.  This basically prevents overfitting and will allow the network to become more flexible in capturing the input.  Below is a figure from the paper that helps illustrate this idea:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/dropout.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 2: The left figure shows the original network, while on the right is the network after dropout has been applied to some of the nodes.
+</div>
+
+<p>Let’s keep exploring the attention mechanism.</p>
+
+<h2 id="attention-observes-it-all">Attention Observes It All</h2>
+
+<p>Though it might be natural to have a large corpus and just never split it up, but parallelizing the data into multiple attention blocks, will not only make it faster but also give different perspectives of the data to each attention head.  The multi-attention head can be visualized as follows:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/multi-head-attention_head.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 3: The multi-attention head.
+</div>
+
+<p>Our implementation of this looks as follows:</p>
+
+<d-code block="" language="python">
+class MultiHeadedAttention(nn.Module):
+    """ Multiple heads of self-attention """
+
+    def __init__(self, number_of_heads, head_size):
+        super().__init__()
+
+        self.heads = nn.ModuleList([AttentionHead(head_size) for _ in 
+                                    range(number_of_heads)])
+        self.proj = nn.Linear( head_size * number_of_heads, \
+                               size_of_granularity_of_representation)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+</d-code>
+
+<p>Now we have the attention based on the interaction of bases/subsequences given their position in the sequence, thus making it data-dependent.  But what if we have something that would reflect upon all these interactions, in order to see if there are more abstract underlying structures in the sequence?  This would be something along the lines of an <em>attention brain</em>.  This is our next step forward.</p>
+
+<h2 id="the-feed-forward-self-reflective-brain">The Feed Forward Self-Reflective Brain</h2>
+
+<p>Now we will have a feed-forward neural network, where each base (and subsequence) tries to learn something about itself given the attention calculation, thus becoming <em>self-reflective</em>.  The code looks like this:</p>
+
+<d-code block="" language="python">
+class FeedForward(nn.Module):
+    """ A self-expansion into a larger neural network with a collapse """
+
+    def __init__(self, size_of_granularity_of_representation):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear( size_of_granularity_of_representation, feed_forward_scaled_expansion * 
+                       size_of_granularity_of_representation ),
+            nn.ReLU(),
+            nn.Linear( feed_forward_scaled_expansion * size_of_granularity_of_representation, 
+                       size_of_granularity_of_representation ),
+            nn.Dropout( dropout ),
+        )
+
+    def forward( self, x ):
+        return self.net( x )
+
+</d-code>
+
+<p>What basically happens here is a neural network expansion of reflecting on the attention of each base or subsequence.  The variable <code class="language-plaintext highlighter-rouge">feed_forward_scaled_expansion</code> assigned a value of 4 performs this expansion, which can be visualized as follows:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/feed-forward.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 4: The feed forward network.
+</div>
+
+<p>Now we have enough that we can put together an encoder block.</p>
+
+<h2 id="the-encoder-block">The Encoder Block</h2>
+
+<p>We are now ready to put it all together, and have implemented it as follows:</p>
+
+<d-code block="" language="python">
+class EncoderBlock(nn.Module):
+    """ The Encoder Block """
+
+    def __init__(self, size_of_granularity_of_representation, number_of_heads):
+        super().__init__()
+        
+        head_size = math.floor( size_of_granularity_of_representation / 
+                                number_of_heads )
+
+        self.self_attention = MultiHeadedAttention( number_of_multiple_heads, head_size )
+        self.feedforward = FeedForward( size_of_granularity_of_representation )
+
+        self.self_attention_layer_norm = nn.LayerNorm( 
+                                            size_of_granularity_of_representation )
+        self.feed_forward_layer_norm = nn.LayerNorm( 
+                                          size_of_granularity_of_representation )
+
+
+    def forward(self, embedded_sequence):
+
+        embedded_sequence = embedded_sequence + \
+                            self.self_attention( 
+                              self.self_attention_layer_norm( embedded_sequence ))
+
+        embedded_sequence = embedded_sequence + \
+                            self.feedforward(
+                              self.feed_forward_layer_norm( embedded_sequence ))
+        
+        return embedded_sequence
+</d-code>
+
+<p>All of this I hope will seem straight-forward.  We now seem to have two additional <a href="https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html">nn.LayerNorm</a> functions in our code.  All that these perform is to ensure the values do not skew the results, by making sure each batch have a mean of 0, and a variance of 1.</p>
+
+<p>The other important element here is the summation to the original result.  These are called <em>residual connections</em> or <em>skip connections</em>, first introduced by Microsoft Research in their paper called <em>Deep Residual Learning for Image Recognition</em>.<d-cite key="he2015deeprl"></d-cite>  These skip connections help speed up the optimization process, during back propagation.  Initially they contribute minimally $\text{–}$ thus not slowing down the process $\text{–}$ but only later begin to come online as they get more weight during this process.</p>
+
+<p>Now that we have one Encoder block, the process might become even better with more blocks.  That is exactly what we will be implementing through our DNAEncoder.</p>
+
+<h2 id="the-dna-encoder">The DNA Encoder</h2>
+
+<p>Our initial goal is that given a sequence there is a gap that needs to be filled at the end of it.  Thus given a trained model, we would like the gap be filled correctly based on its training data.  This should be much smaller and faster than actually searching the genome for the correct contextual subsequence.  Thus we want to build a genomic DNA Encoder, with multiple encoder block passes to improve the prediction power.  Below is our implementation of it:</p>
+
+<d-code block="" language="python">
+class DNAEncoder(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        
+        self.dna_embedding_table = nn.Embedding( dna_vocabulary_length, 
+                                                 size_of_granularity_of_representation )
+        
+        self.encoder_blocks = nn.Sequential(*[EncoderBlock( size_of_granularity_of_representation, 
+                                                            number_of_heads=number_of_multiple_heads) for _ in range(
+                                                            number_of_encoder_blocks ) ] )
+        
+        self.layer_normalize = nn.LayerNorm( size_of_granularity_of_representation ) 
+        
+        self.project_to_dna_vocabulary = nn.Linear( size_of_granularity_of_representation, 
+                                                    dna_vocabulary_length ) 
+
+        # This helps with the optimizer by presetting the weights
+        self.apply(self._init_weights)
+    
+
+    # This code helps with making the optimizer faster
+    def _init_weights(self, module):
+
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_( module.weight, mean=0.0, std=0.02 )
+            
+            if module.bias is not None:
+                torch.nn.init.zeros_( module.bias )
+        
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_( module.weight, mean=0.0, std=0.02 )
+
+
+    def forward( self, sequence_of_indexed_bases_or_subsequences, targets=None ):
+        
+        BATCHES, QUERY_SEQUENCE_LENGTH = sequence_of_indexed_bases_or_subsequences.shape
+
+        sequence_of_embedded_bases_or_subsequences = self.dna_embedding_table( 
+                                                          sequence_of_indexed_bases_or_subsequences ) 
+        
+        positional_encoding = torch.zeros( QUERY_SEQUENCE_LENGTH, 
+                                           size_of_granularity_of_representation )
+
+        for query_base_or_subsequence_position in range( 0, QUERY_SEQUENCE_LENGTH ):
+
+            for embedding_index in range( 0, size_of_granularity_of_representation ):
+
+                denominator = math.pow( 10000, 
+                                        2 * embedding_index / size_of_granularity_of_representation )
+
+                if embedding_index % 2 == 0:  # For even base (or subsequence) positions
+                    positional_encoding[query_base_or_subsequence_position][embedding_index] = \
+                                     math.sin( query_base_or_subsequence_position / denominator)
+                else:                             # For odd base (or subsequence) positions
+                    positional_encoding[query_base_or_subsequence_position][embedding_index] = \
+                                     math.cos( query_base_or_subsequence_position / denominator )
+
+        positional_embedded_sequence = sequence_of_embedded_bases_or_subsequences + positional_encoding
+        
+        logits = self.encoder_blocks( positional_embedded_sequence ) 
+        
+        logits = self.layer_normalize( logits ) 
+        
+        logits = self.project_to_dna_vocabulary( logits )
+
+        if targets is None:
+            loss = None
+        else:
+            
+            BATCHES, QUERY_SEQUENCE_LENGTH, DNA_VOCABULARY = logits.shape
+            
+            logits = logits.view( BATCHES * QUERY_SEQUENCE_LENGTH, DNA_VOCABULARY )
+            targets = targets.view( BATCHES * QUERY_SEQUENCE_LENGTH )
+            loss = F.cross_entropy( logits, targets )
+
+        return logits, loss
+
+
+    def generate(self, sequence_of_indexed_bases_or_subsequences, max_new_tokens):
+        
+        for _ in range( max_new_tokens ):
+            
+            # Here we get the predictions (logits) and loss
+            logits, loss = self( sequence_of_indexed_bases_or_subsequences )
+
+            # The last step is the weighted next probable base
+            logits = logits[:, -1, :] 
+                       
+            # Get the probabilities by applying the softmax
+            probabilities = F.softmax( logits, dim=-1 ) 
+
+            # Get the 1st most probable next base.  
+            # The multinomial will sample based on that, 
+            # though we chose argmax so as to be more explicit.  We commented
+            # the multinomial approach for reference to the reader
+            # next_indexed_base = torch.multinomial( probabilities, num_samples=1 )
+            next_indexed_base = torch.argmax( probabilities ).unsqueeze( dim=0 ).unsqueeze( dim=0 )
+
+            # Now append the predicted base index to the running sequence
+            sequence_of_indexed_bases_or_subsequences = torch.cat( ( sequence_of_indexed_bases, 
+                                                                     next_indexed_base ), dim=1 ) 
+            
+        return sequence_of_indexed_bases_or_subsequences
+</d-code>
+
+<p>You might recognize that we are continuing to use <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html">cross-entropy</a> as our loss function.  Now besides having multiple encoder blocks for improving prediction power, there is one additional element here that is crucial.  We are adding positional encoding to each of the indices, in order to differentiate spatially (temporally) in the sequence, as applied to each base or subsequence.  Thus each vector becomes unique.  Positional encoding is performed via the following two formulas:</p>
+
+<h4 id="for-even-2i-embedding-indices">For even (2i) embedding indices</h4>
+
+\[PositionalEncoding_{pos,2i} = sin(pos/10000^{2i/d_{model}})\]
+
+<h4 id="for-odd-2i1-embedding-indices">For odd (2i+1) embedding indices</h4>
+
+\[PositionalEncoding_{pos,2i+1} = cos(pos/10000^{2i/d_{model}})\]
+
+<p>For a short sequence of 32 bases with 16 embedding indices, the positional embedding is the following:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/positional_encoding.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 5: The positional encoding variation given the base position and embedding index.
+</div>
+
+<p>If we increase both the embedding granularity and the length of the sequence, the positional encoding becomes more obvious in its differentiation:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/positional_encoding_longer.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 6: The positional encoding variation given longer sequences with deeper embedding.
+</div>
+
+<p>If we look at the contributory effect that position has upon the encoding, this can be clearly seen in the following figure:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/positional_encoding_effect.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 7: The effect of position on the encoding.
+</div>
+
+<p>The importance provided by positional encoding is that if we have four (4) encoded bases (and additional subsequences) represented as vectors.  Without the addition of positional encoding to the embedding, we cannot meaningfully distinguish among them in a sequence.  Thus we need a small variation among the vectors to be able to generate slightly diviating new ones that allow us to understand their context in a sequence.</p>
+
+<p>Now we are ready to train a model.</p>
+
+<h2 id="training-the-model">Training the Model</h2>
+
+<p>Before training a model we need to add a few helper functions to assist us:</p>
+
+<d-code block="" language="python">
+# This function provides a batch of either training or validation data
+def get_data_batch_for_processing( training_or_validation_split ):
+    
+    # Generate a small batch of data of 
+    # inputs x and expected targets y
+    
+    data = None
+
+    if training_or_validation_split == 'training':
+        data = training_data
+    else:
+        data = validation_data
+    
+    randomly_sample_by_index = torch.randint( len(data) - 
+                                              sequence_length_required_for_prediction, 
+                                              (batch_size,) )
+    
+    x_inputs = torch.stack( [data[ i:(i + sequence_length_required_for_prediction) ] \
+                            for i in randomly_sample_by_index])
+    
+    y_expected_targets = torch.stack( 
+                           [data[ (i + 1):(i + sequence_length_required_for_prediction + 1) ] \
+                                  for i in randomly_sample_by_index] )
+    
+    return x_inputs, y_expected_targets
+
+
+@torch.no_grad()
+def estimate_the_loss():
+
+    average_loss = {}
+    model.eval()
+
+    for training_or_validation_split in ['training', 'validation']:
+
+        losses = torch.zeros( number_of_losses_to_record )
+
+        for k in range( number_of_losses_to_record ):
+
+            X, Y = get_data_batch_for_processing( training_or_validation_split )
+            logits, loss = model( X, Y )
+            losses[ k ] = loss.item()
+
+        average_loss[ training_or_validation_split ] = losses.mean()
+
+    model.train()
+
+    return average_loss
+</d-code>
+
+<p>Now we can begin to create the model and optimizer:</p>
+
+<d-code block="" language="python">
+# Our model
+model = DNAEncoder()
+
+# Create our optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+</d-code>
+
+<p>You will notice that we are using <a href="https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html">AdamW</a>, where before we used <a href="https://pytorch.org/docs/stable/generated/torch.optim.Adam.html">Adam</a>.  The only major difference is in the weight decay, otherwise they are the same.</p>
+
+<p>Now we are ready to run through 100 steps (rounds) to train the model, while checking on its loss and validation:</p>
+
+<d-code block="" language="python">
+for round_of_iteration in range(number_of_training_iterations + 1):
+
+    # After every 10 rounds we display our loss for both 
+    # training and validation datasets
+    if round_of_iteration % iteration_interval_to_print_loss == 0:
+        losses = estimate_the_loss()
+        print( f"After {round_of_iteration} rounds: training loss={losses['training']:.4f}, \
+                 validation loss={losses['validation']:.4f}" )
+
+    # Get a batch of data
+    x_batch, y_batch = get_data_batch_for_processing( 'training' )
+
+    # Determine the loss
+    logits, loss = model( x_batch, y_batch )
+
+    # Optimize
+    optimizer.zero_grad( set_to_none=True )
+    loss.backward()
+    optimizer.step()           
+</d-code>
+
+<p>Below is our training and validation dataset losses:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="text-align: center">Round</th>
+      <th style="text-align: center">Training Loss</th>
+      <th style="text-align: center">Validation Loss</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align: center">0</td>
+      <td style="text-align: center">6.3932</td>
+      <td style="text-align: center">6.3953</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">10</td>
+      <td style="text-align: center">4.7555</td>
+      <td style="text-align: center">4.7607</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">20</td>
+      <td style="text-align: center">4.7259</td>
+      <td style="text-align: center">4.7211</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">30</td>
+      <td style="text-align: center">4.6002</td>
+      <td style="text-align: center">4.6142</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">40</td>
+      <td style="text-align: center">4.4297</td>
+      <td style="text-align: center">4.4948</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">50</td>
+      <td style="text-align: center">4.2193</td>
+      <td style="text-align: center">4.2346</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">60</td>
+      <td style="text-align: center">4.0673</td>
+      <td style="text-align: center">4.1132</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">70</td>
+      <td style="text-align: center">3.9200</td>
+      <td style="text-align: center">4.0213</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">80</td>
+      <td style="text-align: center">3.7147</td>
+      <td style="text-align: center">3.7543</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">90</td>
+      <td style="text-align: center">3.5165</td>
+      <td style="text-align: center">3.4834</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">100</td>
+      <td style="text-align: center">3.2278</td>
+      <td style="text-align: center">3.1845</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">110</td>
+      <td style="text-align: center">2.8611</td>
+      <td style="text-align: center">2.8419</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">120</td>
+      <td style="text-align: center">2.6257</td>
+      <td style="text-align: center">2.6392</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">130</td>
+      <td style="text-align: center">2.0924</td>
+      <td style="text-align: center">1.9680</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">140</td>
+      <td style="text-align: center">1.1518</td>
+      <td style="text-align: center">1.2116</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">150</td>
+      <td style="text-align: center">0.5888</td>
+      <td style="text-align: center">0.6429</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">160</td>
+      <td style="text-align: center">0.2655</td>
+      <td style="text-align: center">0.2873</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">170</td>
+      <td style="text-align: center">0.0847</td>
+      <td style="text-align: center">0.0730</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">180</td>
+      <td style="text-align: center">0.0158</td>
+      <td style="text-align: center">0.0159</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">190</td>
+      <td style="text-align: center">0.0078</td>
+      <td style="text-align: center">0.0077</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">200</td>
+      <td style="text-align: center">0.0040</td>
+      <td style="text-align: center">0.0041</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Below is a figure illustrating the training and validation loss over 200 rounds:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/training_and_validation_losses.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 8: The training and validation loss across 200 rounds.
+</div>
+
+<p>Naturally the losses look good, with a decrease to with each round down to a low loss after 200 rounds.  All of these all were performed on a CPU, which took less than 30 seconds, and if a GPU would have been utilized then more rounds could have been processed faster.</p>
+
+<h2 id="making-some-predictions">Making Some Predictions</h2>
+
+<p>Now let us try to predict some bases in a gap.  We will want to predict what the bases are in the gap between the two subsequences:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>CCACCCAATTGTGGTTGTGCAGCCAGATGCCT--ACAGAGGA
+</code></pre></div></div>
+
+<p>Before we perform the predictions, we will need a couple of helper functions:</p>
+
+<d-code block="" language="python">
+# This function will look at a dictionary of bases::base_counts for picking
+# the most reprented base
+def get_most_represented_base( base_dictionary ):
+    
+    most_represented_base = ''
+    max_representation_count = 0
+    
+    for base in base_dictionary:
+        if int( base_dictionary[ base ] ) &gt; max_representation_count:
+            max_representation_count = int( base_dictionary[ base ] )
+            most_represented_base = base
+    
+    return most_represented_base
+    
+# This function will take a DNAEncoder model and a sequence and
+# make a prediction of the most likely base.  The function takes
+# the whole sequence and keeps making it one base smaller until 
+# it reaches only one base, and with each round will perform a
+# prediction.  Each prediction will populate a dictionary of
+# base::base_count, which will be provided to the 
+# get_most_represented_base() function to determine  
+# the most probable next base.
+def base_predictor( model, sequence ):
+
+    base_dictionary = {}
+    base_dictionary[ 'A' ] = 0
+    base_dictionary[ 'T' ] = 0
+    base_dictionary[ 'G' ] = 0
+    base_dictionary[ 'C' ] = 0
+
+    for i in range( 0, len( sequence ) ):
+        
+        sequence_to_encode = sequence[ i: ]
+        
+        context = torch.tensor( encode_sequence_as_indices( sequence_to_encode, 
+                                                            dna_vocabulary_to_index_dictionary, 
+                                                            GENOME_SPLICE_SIZE), dtype=torch.long )
+        context = context.unsqueeze( dim=0 )
+        
+        sequence_with_new_base = model.generate( context, max_new_tokens=1 )
+        sequence_with_new_base_as_list = sequence_with_new_base.squeeze( dim=0 ).tolist()
+        
+        predicted_base_as_index = [ sequence_with_new_base_as_list[-1] ]
+        
+        predicted_sequence = decode_indices_into_sequence( predicted_base_as_index, 
+                                                           index_to_dna_vocabulary_dictionary )
+        
+        predicted_base = predicted_sequence[0]
+        
+        base_dictionary[ predicted_base ] = base_dictionary[ predicted_base ] + 1
+    
+    print( "Predicted base distribution: " + str( base_dictionary ) )
+    
+    most_represented_base = get_most_represented_base( base_dictionary )
+    
+    print( sequence + '[' + most_represented_base + ']' )
+</d-code>
+
+<p>For this we will start with the subsequence <code class="language-plaintext highlighter-rouge">CCACCCAATTGTGGTTGTGCAGCCAGATGCCT</code> as the context to begin with, which we will provide to the model (the sequence is 32 bases as that is minimum length for making a prediction):</p>
+
+<d-code block="" language="python">
+# The first context to try for predicting the next base
+base_predictor( model, 'CCACCCAATTGTGGTTGTGCAGCCAGATGCCT' )
+</d-code>
+
+<p>Below is the output:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>Predicted base distribution: {'A': 11, 'T': 6, 'G': 15, 'C': 0}
+CCACCCAATTGTGGTTGTGCAGCCAGATGCCT[G]
+</code></pre></div></div>
+
+<p>The predicted <code class="language-plaintext highlighter-rouge">G</code> base is the correct one.  Below is the prediction of base distribution across the subsequences:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/base_distribution_sequence_1.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 9: The prediction of base distribution across the subsequences of sequence `CCACCCAATTGTGGTTGTGCAGCCAGATGCCT`.
+</div>
+
+<p>Now let’s try it with the same predicted sequence $\text{–}$ shifted to the left by 1 base $\text{–}$ to get the next predicted base:</p>
+
+<d-code block="" language="python">
+base_predictor( model, 'CACCCAATTGTGGTTGTGCAGCCAGATGCCTG' )
+</d-code>
+
+<p>Below is the output:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>Predicted base distribution: {'A': 13, 'T': 4, 'G': 15, 'C': 0}
+CACCCAATTGTGGTTGTGCAGCCAGATGCCTG[G]
+</code></pre></div></div>
+
+<p>The predicted <code class="language-plaintext highlighter-rouge">G</code> base is the correct one.  Below is the prediction of base distribution across the subsequences:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/base_distribution_sequence_2.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 10: The prediction of base distribution across the subsequences of sequence `CACCCAATTGTGGTTGTGCAGCCAGATGCCTG`.
+</div>
+
+<p>Thus the encoder was able to correctly predict the missing bases that needed to fill the gap:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code>CACCCAATTGTGGTTGTGCAGCCAGATGCCT[GG]ACAGAGGA
+</code></pre></div></div>
+
+<p>These results look promising!  In the next section we will dive a bit deeper on what the model actually learned from the language of a genomic sequence.</p>
+
+<h2 id="what-has-the-model-learned-diving-deeper-into-the-dna-encoder-model">What has the model learned? Diving Deeper Into the DNA Encoder Model</h2>
+
+<p>PyTorch has made it easy to look inside the model to determine what the DNA embeddings have learned from the genomic sequence through optimization via backpropagation:</p>
+
+<d-code block="" language="python">
+# The following function will augment the DNAEncoder class
+class DNAEncoder(nn.Module):
+
+    def get_sequence_embedding(self, embedded_sequence_index ):
+        
+        return self.dna_embedding_table( embedded_sequence_index ) 
+</d-code>
+
+<p>With this code we can extract the embedding table and frequency distribution of subsequences within the genome:</p>
+
+<d-code block="" language="python">
+# Produce the subsequence genomic frequency distribution
+alphabet_frequency = {}
+
+for substring in dna_vocabulary:
+    
+    index = -1
+    count = 0
+
+    while True:
+        index = genome.find( substring, index + 1, len(genome) )
+        if index &gt; -1:
+            count = count + 1
+        else:
+            alphabet_frequency[ substring ] = count
+            break
+         
+embedding_header_file = open( r"embeddings_header.csv", "w+" )
+embedding_file = open( r"embeddings.csv", "w+" )
+alphabet_frequency_file = open( r"alphabet_frequency.csv", "w+" )
+
+# Store the subsequence genomic frequency distribution to a file
+for substring in alphabet_frequency:
+    alphabet_frequency_file.write( substring + ', ' + 
+                                   str(alphabet_frequency[ substring ]) + '\n' )
+    
+alphabet_frequency_file.flush()
+alphabet_frequency_file.close()
+
+
+# Extract the embeddings of all subsequences, and
+# store the embeddings to a file
+for index in range( 0, len(dna_vocabulary) ):
+    embedding = model.get_sequence_embedding( torch.tensor( index ) )
+    list_of_floats = embedding.tolist()
+    embeddings_as_string = ''
+    embeddings_as_string = str( list_of_floats[0] ) 
+    for i in range(1, len(list_of_floats)):
+        embeddings_as_string = embeddings_as_string  + \
+                               ", " + str( list_of_floats[i] ) 
+    embedding_file.write( embeddings_as_string + '\n' )
+    embedding_header_file.write( dna_vocabulary[index] + '\n' )
+
+embedding_header_file.flush()
+embedding_header_file.close()
+
+embedding_file.flush()
+embedding_file.close()
+</d-code>
+
+<p>Given the embedding vectors of substrings we can perform the dot product of the embedding table to itself via the following:</p>
+
+\[DNA\_Embedding\_Table^T \cdot DNA\_Embedding\_Table\]
+
+<p>This will produce the $|Sequence| \times |Sequence|$ matrix highlighting the pairwise subsequence affinity each other.  This can be visualized as a heatmap:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/embedding_heatmap.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 11: The pairwise affinity of the genomic embeddings given their dot product shown as a heatmap.
+</div>
+
+<p>One noteable feature within the heatmap that jumps out is the emphasis on longer sequences, which makes sense as shorter sequences should have higher frequency, thus more entropy.  We could peek at the distribution of the most frequent subsequences, which might give us some insight into their shared properties:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-14-shallowconsensus/subsequence_frequency_distribution.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 11: The distribution of subsequence frequencies across the genome.
+</div>
+
+<p>We can begin to see that the most frequent subsequences are naturally biased towards the more shorter sequences, which confirms that the embedding is weighted via backpropagation more towards the longer, less frequent subsequences.  This naturally will shift the information towards the longer sequences, thus becoming more selective with predicting the next base, as supported by the highest attention for a given a subsequence.</p>
+
+<p>There is more analysis in the works with which this report will be updated, but I hope this provides an overview of how using only the encoder of a transformer, one can fill in sequence gaps based on a model trained with the language of a genomic sequence.</p>]]></content><author><name>Paul Grosu</name></author><category term="genomics" /><category term="machine-learning" /><category term="machine-learning" /><summary type="html"><![CDATA[This is a blog to demystify encoders in Large Language Model (LLM) transformers as applied to genomics via a simplified gap-aware sequence transformer named ShallowConsensus.]]></summary></entry><entry><title type="html">ShallowVariant</title><link href="https://pgrosu.github.io/blog/2023/shallowvariant/" rel="alternate" type="text/html" title="ShallowVariant" /><published>2023-11-04T11:12:00-04:00</published><updated>2023-11-04T11:12:00-04:00</updated><id>https://pgrosu.github.io/blog/2023/shallowvariant</id><content type="html" xml:base="https://pgrosu.github.io/blog/2023/shallowvariant/"><![CDATA[<p>In the previous <a href="../wdml-part-1">blog</a> we discussed how a neural network works.  Here we will build a simpler variation of <a href="https://github.com/google/deepvariant">Google’s DeepVariant</a><d-cite key="poplin2018deepvariant"></d-cite> using a neural network, to illustrate a practical example in the area of Genomics with Machine Learning.</p>
+
+<h2 id="downloading-the-data">Downloading the Data</h2>
+
+<p>The first step is to download the necessary files:</p>
+
+<ol>
+  <li>
+    <p>The first file we will download are the alignment files (BAM and BAI) for chromosome 20 of sample NA12878 (phase 3) from the 1000 Genomes dataset.<d-footnote>Sample NA12878 (1000 Genomes phase 3): <a href="https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/phase3/data/NA12878/alignment/">https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/phase3/data/NA12878/alignment/</a></d-footnote></p>
+  </li>
+  <li>
+    <p>The next file we will download is the Human Genome assembly GRCh37 (specifically hs37d5), since that was the reference used for aligning the FASTQ sequences in generating the BAM file.<d-footnote>Human Genome assembly GRCh37 (hs37d5) reference: <a href="https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/phase2_reference_assembly_sequence/">https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/technical/reference/phase2_reference_assembly_sequence/</a></d-footnote></p>
+  </li>
+</ol>
+
+<p>These two files are sufficient to get us started.  Throughout this blog other commonly used bioinformatic tools will be utilized to keep the example simple.</p>
+
+<h2 id="performing-the-pileup-to-generate-candidate-variants-with-truth-values">Performing the Pileup to Generate Candidate Variants with Truth Values</h2>
+
+<p>The next step is to extract candidate variants from the BAM file, by performing a pileup. A pileup is an aligment (mapping) of reads to a reference.  If there is a region of variation among the reads and reference, then these will become candidates.  In our case we will use <a href="https://github.com/freebayes/freebayes">freebayes</a>, but other tools like <a href="https://samtools.github.io/bcftools/howtos/variant-calling.html">bcftools mpileup</a> will also work.  The idea is to focus on bi-allelic SNPs (just to keep the problem simple), which we can use to build a neural network to predict the genotype.  Since a pileup provides the position, we would not need the bases, and can rely only on the <em>reference</em> and <em>alternate allelic depths</em>.  These provide information regarding the number of reads that support the reference or alternate allele.</p>
+
+<p>Thus our goal is to see if we can estimate the genotypes from just the <em>reference</em> and <em>alternate allelic depths</em>, and use the truth values<d-footnote>Truth values denote what would be the known and expected empirically derived values.</d-footnote> of known genotypes to train the weights of our neural network appropriately $\text{–}$ with the hope of uncovering this correspondence between <em><ins>coverage</ins></em> (depths) and <em><ins>genotype</ins></em>.  Our hypothesis is that there is correlation between the coverage (depths) and genotype.  Thus, all we will need are the following elements:</p>
+
+<ul>
+  <li>Reference Counts</li>
+  <li>Alternate Counts</li>
+  <li>Genotype</li>
+</ul>
+
+<p>Therefore, we will run the following two commands to generate the answers:</p>
+
+<d-code block="" language="bash">
+# This command will generate the SNP candidates (among other ones), along with 
+# their corresponding genotypes and allelic depths.  These will be the truth set.
+freebayes -f hs37d5.fa \
+  NA12878.chrom20.ILLUMINA.bwa.CEU.low_coverage.20121211.bam &gt; candidates-freebayes.vcf
+
+# This command will extract the reference base, alternate base, genotype and 
+# allelic depths.  These will be used in building the neural network.
+bcftools query -f '%REF,%ALT,[%GT,%AD]' candidates-freebayes.vcf &gt; ref_alt_gt_ad.txt
+</d-code>
+
+<p>The output of <code class="language-plaintext highlighter-rouge">ref_alt_gt_ad.txt</code> will look something like this (for just the bi-allelic SNPs):</p>
+
+<d-code block="" language="bash">
+A,C,1/1,0,5
+G,A,1/1,0,5
+G,C,1/1,0,5
+T,C,1/1,0,4
+C,T,0/0,7,2
+C,A,0/0,2,2
+...
+</d-code>
+
+<p>I do realize there are additional filtering criteria such as minium coverage, and base quality scores, but we want to keep this example simple to connect the big ideas together $\text{–}$ and not become lost in the details.</p>
+
+<p>The next step is to prepare these values for training a machine learning model.</p>
+
+<h2 id="defining-the-input-tensor-and-output-labels">Defining the Input (Tensor) and Output Labels</h2>
+
+<p>Now that we have <code class="language-plaintext highlighter-rouge">bcftools</code>-processed candidates from the VCF file, let’s try to generate the input to a neural network.  In our example, the machine learning framework we will use is <a href="https://pytorch.org/">PyTorch</a>.  For a neural network model in PyTorch, the standard input is a <a href="https://pytorch.org/docs/stable/tensors.html">tensor</a>.</p>
+
+<p>Since we’ll be taking a simpler approach, we will base our genotype predictions based on the following ratio (the symbols $||$ just refer to count or cardinality):</p>
+
+\[genotype \; \propto \dfrac{|reference|}{|reference| + |alternate|}\]
+
+<p>Regarding the output genotype labels, they would need to have some form of numerical class label in order to be computable.  Thus let’s label $homozygous \; reference$, $heterozygous$, and $heterozygous \; alternate$ as $1$ through $3$ $\text{–}$ with missing or uncallable (./.) labeled as $0$:</p>
+
+\[./. \rightarrow 0\]
+
+\[0/0 \rightarrow 1\]
+
+\[0/1 \: or \: 1/0 \rightarrow 2\]
+
+\[1/1 \rightarrow 3\]
+
+<p>Thus before going too deep, let’s plot these and visualize what the genotype classes look like:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/Linear_Read_Depth.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 1: This illustrates the plot of the fraction of reference read counts versus alternate read counts as compared to the total read depth.
+</div>
+
+<p>Based on the figure above, the genotype classes do not seem to separate very well, thus making the stratification by genotype-classes is not as clean.  The fix would be to transform the space the data lives in, and a simple way would be to put them into $log$-$space$ by taking the $log_2$ of the two fractions:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/Log2_Read_Depth.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 2: This illustrates the $log_2$ transformed plot of the fraction of reference read counts versus alternate read counts as compared to the total read depth.
+</div>
+
+<p>Now there seem to be better separation among the classes, allowing for the weights of the neural network model to be able to classify among the genotypes.</p>
+
+<h2 id="loading-and-processing-the-data">Loading and Processing the Data</h2>
+
+<p>Now we will be getting into the details of how to use PyTorch.  We have a file called <code class="language-plaintext highlighter-rouge">ref_alt_gt_ad.txt</code> that we want to load.  Let’s first start with a few variable definitions and helper functions.</p>
+
+<d-code block="" language="python">
+# The reference and alternate allele count fractions
+number_of_inputs = 2
+
+# This is the number of neurons in the hidden layer between the input and output
+number_of_neurons_in_hidden_layer = 6
+
+# This will represent four classes of predicted outputs: ./., 0/0, (0/1 or 1/0), 1/1
+number_of_genotype_classes = 4 
+
+# This represents the number of training or testing rounds (epochs)
+number_of_training_or_testing_rounds = 10
+
+# The path of our truth set, containing reference count, allele count and genotypes
+labeled_data_file = 'ref_alt_gt_ad.txt'
+
+# Helper function for converting genotypes to numeric labels
+def convert_genotype_to_number( genotype ):
+    if '0/0' in genotype:
+        return 1
+    if '0/1' in genotype:
+        return 2
+    if '1/0' in genotype:
+        return 2
+    if '1/1' in genotype:
+        return 3
+    else:
+        return 0
+
+
+# A helper function for converting numeric labels to genotypes 
+def convert_numeric_class_to_genotype( numeric_genotype_tensor ):
+
+    genotype_numeric_list = numeric_genotype_tensor.tolist()
+    
+    genotypes=[]
+    
+    for i in range(0, len( genotype_numeric_list )):
+        if genotype_numeric_list[i] == 0:
+            genotypes.append( './.' )
+            continue
+        if genotype_numeric_list[i] == 1:
+            genotypes.append( '0/0' )
+            continue
+        if genotype_numeric_list[i] == 2:
+            genotypes.append( '0/1' )
+            continue
+        if genotype_numeric_list[i] == 3:
+            genotypes.append( '1/1' )
+            continue
+    
+    return genotypes
+
+
+# Helper function for determining the number of rows in a file
+def get_total_rows( data_file ):
+    with open(data_file, newline='') as candidates_file:
+        data = csv.reader(candidates_file, delimiter=' ', quotechar='|')
+        row_counter = 0
+        for row in data:
+            row_counter = row_counter + 1
+        return row_counter
+
+# Defining the number of rows in a file for array instantiation
+number_of_rows = int( get_total_rows( labeled_data_file ) )
+
+# Defining NumPy arrays that will contain the reference and allele fractions
+X = np.zeros( (number_of_rows, number_of_inputs), dtype=float )
+
+# Defining a NumPy array for output (genotype) labels 
+y = np.zeros( (number_of_rows), dtype=int )
+</d-code>
+
+<p>The <code class="language-plaintext highlighter-rouge">X</code> and <code class="language-plaintext highlighter-rouge">y</code> vectors are instantiated as <a href="https://numpy.org/doc/stable/reference/generated/numpy.ndarray.html">NumPy arrays</a> $\text{–}$ with all zero values $\text{–}$ and having the following dimensions (shapes):</p>
+
+<ul>
+  <li>X has dimensions 74732 rows x 2 columns, where two represents the reference and alternate allele</li>
+  <li>y has dimensions 74732 elements to store the genotypes.  You can think of it having one
+74732 rows x 1 column, which is equivalent.</li>
+</ul>
+
+<p>The values in X look as follows:</p>
+<d-code block="" language="python">
+print(X)
+
+array([[0., 0.],
+       [0., 0.],
+       [0., 0.],
+       ...,
+       [0., 0.],
+       [0., 0.],
+       [0., 0.]])
+
+print( X.shape )
+
+(74732, 2)
+
+# This shows the type being a NumPy ndarray class
+print( type(X) )
+
+&lt;class 'numpy.ndarray'&gt;
+</d-code>
+
+<p>The values in y look as follows:</p>
+
+<d-code block="" language="python">
+print( y )
+
+array([0, 0, 0, ..., 0, 0, 0])
+
+print( y.shape )
+
+(74732,)
+
+# This shows the type being a NumPy ndarray class
+print( type(y) )
+
+&lt;class 'numpy.ndarray'&gt;
+</d-code>
+
+<p>Next let’s define the function for loading the data:</p>
+
+<d-code block="" language="python">
+def load_data( filename=labeled_data_file ):
+    with open(filename, newline='') as candidates_file:
+        data = csv.reader(candidates_file, delimiter=' ', quotechar='|')
+        row_counter = 0
+        for row in data:
+            row_element = row[0]
+            row_split = row_element.split(',')
+            if len(row_split) &gt; 5: # skip multi-allelic sites
+                continue
+            reference = row_split[0]
+            alternate = row_split[1]
+            genotype = row_split[2]
+            reference_read_count = int( row_split[3] )
+            alternate_read_count = int( row_split[4] )
+
+            total_read_count = reference_read_count + alternate_read_count
+            
+            # Skip low coverage sites
+            if total_read_count &lt; 10:
+                continue
+            
+            # In case of zero reference counts (for division by zero errors).
+            # An increment of 1 will not impact the overall classification results,
+            # because the minimum read counts would need to be at least 10.
+            if reference_read_count == 0:
+                reference_read_count = 1
+                total_read_count = total_read_count + 1
+                
+            # In case of zero alternate counts (for division by zero errors).
+            # An increment of 1 will not impact the overall classification results,
+            # because the minimum read counts would need to be at least 10.
+            if alternate_read_count == 0:
+                alternate_read_count = 1
+                total_read_count = total_read_count + 1
+                        
+            reference_reads_to_fill = int( number_of_inputs * 
+                                           fraction( reference_read_count, 
+                                                     total_read_count ) )
+            
+            # Log2 Transformed Read Ratios
+            # For reference-supporting read counts
+            X[ row_counter ][0] = math.log( float(reference_read_count) / 
+                                            float(total_read_count), 2 )
+
+            # For alternate allele-supporting read counts
+            X[ row_counter ][1] = math.log( float(alternate_read_count) / 
+                                            float(total_read_count), 2 )
+            
+            # Convert the genotypes to numeric labels
+            y[ row_counter ] = convert_genotype_to_number( genotype )
+            
+            row_counter = row_counter + 1
+
+load_data( filename=labeled_data_file )
+</d-code>
+
+<p>Next we will define the multi-class neural network model.</p>
+
+<h2 id="defining-the-multiclass-neural-network-model">Defining the MultiClass Neural Network Model</h2>
+
+<p>Let’s define the general network model for classifying for multiple genotype labels (i.e. more than two, or binary):</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/multiclass_model.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 3: This illustrates the multiclass neural network model we will be implementing.
+</div>
+
+<p>This is the same 2-layer neural network model you have seen before, but there are a few new additions.  One of the most obvious additions is the increased number of nodes.  We put more nodes at the beginning to get more details and the summarized the pertinent information by selecting only four nodes in the second hidden layer.  That is a very common approach in neural network design to have more nodes initially and then focusing the results down the network to fewer and fewer ones.</p>
+
+<p>Another element in this network is the new activation function called $ReLU$, which stands for <em>Rectified Linear Unit</em>.  Its behavior is by returning a value of $0$ for any input below 0, and returning back the input for anything higher than $0$.  This is defined as follows:</p>
+
+\[f(x) = max(0, x) =
+    \begin{cases}
+      0 &amp; f(x) &lt; 0 \\
+      x &amp; f(x) \geq 0
+    \end{cases}\]
+
+<p>Here x can represent complex interactions among multiple variables, which is transmitted to the next nodes of the model.  The graph below shows the general behavior of the activation function:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/relu_activation_function.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 4: This is the graphical representation of the ReLU activation function.
+</div>
+
+<p>The other characteristic that this model contains is the $softmax$ function, which turns a vector of values into probabilities (i.e. the sum of the values will then be equal to 1).  The $softmax$ function is the following:</p>
+
+\[\sigma(\vec{z}) = \dfrac{e^{z_i}}{\Sigma^{K}_{j=1}e^{z_j}}\]
+
+<p>Let’s begin to code the model up:</p>
+
+<d-code block="" language="python">
+class GenotypeClassifier(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.main = torch.nn.Sequential(
+            torch.nn.Linear(input_size, hidden_size),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_size, output_size)
+        )
+
+    def forward(self, x):
+        out = self.main(x)
+        return out
+</d-code>
+
+<p>You will notice that we inherit the class <a href="https://pytorch.org/docs/stable/generated/torch.nn.Module.html">torch.nn.Module</a>, which is the base class for neural networks in PyTorch.  Then we utilize the <a href="https://pytorch.org/docs/stable/generated/torch.nn.Linear.html">torch.nn.Linear</a> class, which performs the linear transformations of $X \cdot W^T + bias$ calculations (where $W^T$ is the transpose of the weights).</p>
+
+<p>One more important element when building a model is to randomize the data, and then use 80% for training the model and 20% for subsequently testing it.  The testing step usually is not randomized.  In our case we will randomly shuffle both stages, as the data loading methods in PyTorch will keep providing the same input for every round, which would not perform proper validation.</p>
+
+<p>Let’s now train and test the neural network.</p>
+
+<h2 id="implementing-the-multiclass-neural-network-model">Implementing the MultiClass Neural Network Model</h2>
+
+<p>The first step is to define the model and a few initial variables that we will use:</p>
+
+<d-code block="" language="python">
+# We will need to split our data into a training and testing group.
+# The training set will be composed of randomly selected values 
+# representing 80% of the data.
+# The testing set will be composed of randomly selected values 
+# representing 20% of the data.
+TEST_SIZE = 0.2
+
+# The batch size represents how much of the data at a time will 
+# be used during rounds of training or testing (epochs).  In this 
+# case an epoch will represent a round of training, with a total 
+# of 10 rounds.  In each round, 6700 values of the input will 
+# be used.
+BATCH_SIZE = 6700
+
+# This is a value to randomize the random number generator used 
+# when selecting values.
+SEED = 42
+
+# Here we will generate the training set, and the test set for both 
+# the input (X) and output (y).  Here the input represents the ratios 
+# of reference and alternate allele counts compared to the total.  
+# The output represents the numeric genotype values.
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=TEST_SIZE,
+    random_state=SEED
+)
+
+# Here we store the size of the training and test sets for calculating the accuracy of
+# our model's predictions.
+train_size = len(X_train)
+test_size = len(X_test)
+</d-code>
+
+<p>If we print the values for <code class="language-plaintext highlighter-rouge">train_size</code> and <code class="language-plaintext highlighter-rouge">test_size</code> they will be 59785 and 14947, respectively.</p>
+
+<p>The next we will generate the <a href="https://pytorch.org/tutorials/beginner/introyt/tensors_deeper_tutorial.html">tensors</a>.  A tensor is the equivalent of the NumPy array, and is the standard data format in machine learning platforms, since it can remember additional parameters such as if it should reside on a GPU or CPU.  Usually the shape (dimensions) of a tensor is defined as $(batch, channels, rows, columns)$, where channels are different data values of the rows and column, such as RGB (red, green, blue) values for an image.  Batches are how many groups (sets) of the dimensions below $(channels, rows, columns)$ should be taken together in a calculation, such as for training or testing (validation).</p>
+
+<p>Below are the instantiations of the tensors:</p>
+
+<d-code block="" language="python">
+X_train = torch.tensor(X_train, dtype=torch.float32)
+y_train = torch.tensor(y_train, dtype=torch.int64)
+X_test = torch.tensor(X_test, dtype=torch.float32)
+y_test = torch.tensor(y_test, dtype=torch.int64)
+</d-code>
+
+<p>Next we will create <a href="https://pytorch.org/docs/stable/data.html#iterable-style-datasets">dataset tensors</a> to perform on-the-fly (lazy) data set reprentations for both training and testing.  We will use <a href="https://pytorch.org/docs/stable/data.html#torch.utils.data.DataLoader">dataloaders</a> to shuffle and iterate over them.  This <a href="https://pytorch.org/tutorials/beginner/basics/data_tutorial.html">nice tutorial</a> provides a more friendly definition with examples.</p>
+
+<d-code block="" language="python">
+dataset_train = TensorDataset(X_train, y_train)
+dataset_test = TensorDataset(X_test, y_test)
+
+dataloader_train = DataLoader(dataset_train, batch_size=BATCH_SIZE, shuffle=True)
+dataloader_test = DataLoader(dataset_test, batch_size=BATCH_SIZE, shuffle=True)
+</d-code>
+
+<p>Finally, let us define our model:</p>
+
+<d-code block="" language="python">
+# Here we initialize the GenotypeClassifier with:
+#  * The number of inputs
+#  * The number of nodes in the hidden layer
+#  * The number of outputs
+# The instantiation below is equivalent to: 
+#    shallow_variant_model = GenotypeClassifier(2, 6, 4)
+shallow_variant_model = GenotypeClassifier( number_of_inputs, 
+                                            number_of_neurons_in_hidden_layer, 
+                                            number_of_genotype_classes )
+</d-code>
+
+<p>We will be training the model in batches, since we do not have enough computing power to train the whole dataset at once.  Therefore with each training round (epoch), we take a batch and compare after training with how it performs against the expected (true) <code class="language-plaintext highlighter-rouge">y</code> values.  Basically we compare the predicted $y$ with the true $y$, and based on their difference we optimize the model.  With a bigger difference we optimize more, and vice versa if less.  The $criterion$ measures how wrong our model performs, which is usually called the $loss \; (cost) \; function$.  The loss will be used by the $optimizer \; function$ to adjust the model’s weights for the next round.  Since we will be classifying across multiple classes, we will utilize the <a href="https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html">CrossEntropyLoss</a> function:</p>
+
+<d-code block="" language="python">
+# The Loss function
+criterion = torch.nn.CrossEntropyLoss() 
+</d-code>
+
+<p>The basic formula for cross entropy loss is the following:</p>
+
+\[Loss(\hat{y}, y) = - \Sigma^{K}_{k} y_k \cdot log( \hat{y}_k )\]
+
+<p>Assuming the values of y are between 0 and 1, what the above formula calculates is the deviation among predicted outputs $\hat{y}$ in a batch, as compared to true (expected) values ($y$).  What it really performs is the <a href="https://en.wikipedia.org/wiki/Entropy_(information_theory)">information (entropy, $H$)</a> when having varied distributions.  If the values are random, then these values will be high, and thus have a big loss (wrong result), requiring a larger shift in the weights of the neural network.  Otherwise, they will stabilize and the loss will become minimal $\text{–}$ which is ideal $\text{–}$ making the model highly accurate in predicting the outcome.</p>
+
+<p>Given the $loss \; function$ (or $criterion$), there needs to be another function to optimize based on the loss.  For that we will use the <a href="https://pytorch.org/docs/stable/generated/torch.optim.Adam.html">Adam optimizer</a>:</p>
+
+<d-code block="" language="python">
+# The (Adam) optimization algorithm
+optimizer = torch.optim.Adam( shallow_variant_model.parameters(), lr=0.2 )  
+</d-code>
+
+<p>The Adam (Adaptive Moment Estimation) optimizer<d-cite key="kingma2017adam"></d-cite> was first proposed in 2014 (with multiple updates following it) by Diederik P. Kingma and Jimmy Ba.  The general intuition is that it has the advantage over other ones by adaptively adjusting the learning rate of each weight based on previous gradients, thus it converges much faster.  The <code class="language-plaintext highlighter-rouge">lr</code> parameter is the initial learning rate to start with, meaning by how much to adjust the weights the first time when no gradients are available.</p>
+
+<p>Now we are ready to begin to train the model.</p>
+
+<h2 id="training-the-model">Training the Model</h2>
+
+<p>Now we are ready to run through 10 epochs (rounds) to train the model, while checking on its loss and accuracy:</p>
+
+<d-code block="" language="python">
+for epoch in range( number_of_training_or_testing_rounds ):
+    losses = 0
+    correct = 0
+    total = 0
+    for X_batch, y_batch in dataloader_train:
+        optimizer.zero_grad()                    # Reset the gradients for re-optimization
+        y_pred = shallow_variant_model(X_batch)  # Run the model to get the predictions
+        loss = criterion(y_pred, y_batch)        # Calculate the loss
+        loss.backward()                          # Determine the gradients of the weights and biases
+        optimizer.step()                         # Update the weights biases
+        losses = losses + loss.item()            # Add the loss for this batch to the running total
+        correct = correct + correct_count( y_pred, y_batch )
+        total = total + 1
+    print( f"epoch: {epoch + 1} | loss: {losses / len(dataloader_train):.4f} | 
+             accuracy: {100*(correct / train_size):.2f}" )             
+</d-code>
+
+<p>You might notice that we have a <code class="language-plaintext highlighter-rouge">correct_count()</code> function specified above.  All that function performs is to determine how many of the predicted values <code class="language-plaintext highlighter-rouge">y_pred</code> match with the true values of <code class="language-plaintext highlighter-rouge">y_batch</code>.  The contents of the function are the following:</p>
+
+<d-code block="" language="python">
+def correct_count( y_pred, y_true ):
+    correct = 0
+    y_pred_argmax = torch.argmax(y_pred, dim=1)
+     
+    for i in range(0, len(y_pred_argmax) ):
+        if (y_pred_argmax[i] - y_true[i]) == 0:
+            correct = correct + 1
+    
+    return correct
+</d-code>
+
+<p>While training the model, below is the output of each epoch:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="text-align: center">Epoch</th>
+      <th style="text-align: center">Loss</th>
+      <th style="text-align: center">Accuracy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align: center">1</td>
+      <td style="text-align: center">0.2682</td>
+      <td style="text-align: center">97.07 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">2</td>
+      <td style="text-align: center">0.0249</td>
+      <td style="text-align: center">98.19 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">3</td>
+      <td style="text-align: center">0.0203</td>
+      <td style="text-align: center">99.26 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">4</td>
+      <td style="text-align: center">0.0179</td>
+      <td style="text-align: center">99.26 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">5</td>
+      <td style="text-align: center">0.0141</td>
+      <td style="text-align: center">99.30 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">6</td>
+      <td style="text-align: center">0.0137</td>
+      <td style="text-align: center">99.36 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">7</td>
+      <td style="text-align: center">0.0124</td>
+      <td style="text-align: center">99.39 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">8</td>
+      <td style="text-align: center">0.0121</td>
+      <td style="text-align: center">99.42 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">9</td>
+      <td style="text-align: center">0.0119</td>
+      <td style="text-align: center">99.41 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">10</td>
+      <td style="text-align: center">0.0117</td>
+      <td style="text-align: center">99.45 %</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Below is a graph representing the above results:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/training_loss_and_accuracy.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 5: This shows the relationship of the loss and accuracy of the model, while it is being trained throughout the epochs.
+</div>
+
+<p>The general idea is that a model as it is being trained with each round will have a lower loss and become more accurate, which this is being exhibited here.</p>
+
+<h2 id="testing-the-model">Testing the Model</h2>
+
+<p>Now we are ready to test how good our model behaves with testing data, which it has not seen before.  Again we will go through 10 epochs (rounds) of testing, while checking on its loss and accuracy:</p>
+
+<d-code block="" language="python">
+shallow_variant_model.eval()
+with torch.inference_mode():
+    for epoch in range( number_of_training_or_testing_rounds ):
+        losses = 0
+        correct = 0
+        total = 0
+        for X_batch, y_batch in dataloader_test:
+            y_pred = shallow_variant_model(X_batch)  # Run the model to get the predictions
+            loss = criterion(y_pred, y_batch)        # Calculate the loss
+            losses = losses + loss.item()            # Add the loss for this batch to the running total
+            correct = correct + correct_count( y_pred, y_batch )
+            total = total + 1
+        print( f"epoch: {epoch + 1} | loss: {losses / len(dataloader_test):.4f} | 
+                 accuracy: {100*(correct / test_size):.2f}")                 
+</d-code>
+
+<p>While testing the model, below is the output of each epoch:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="text-align: center">Epoch</th>
+      <th style="text-align: center">Loss</th>
+      <th style="text-align: center">Accuracy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align: center">1</td>
+      <td style="text-align: center">0.0095</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">2</td>
+      <td style="text-align: center">0.0105</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">3</td>
+      <td style="text-align: center">0.0110</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">4</td>
+      <td style="text-align: center">0.0093</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">5</td>
+      <td style="text-align: center">0.0119</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">6</td>
+      <td style="text-align: center">0.0106</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">7</td>
+      <td style="text-align: center">0.0108</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">8</td>
+      <td style="text-align: center">0.0096</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">9</td>
+      <td style="text-align: center">0.0094</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">10</td>
+      <td style="text-align: center">0.0106</td>
+      <td style="text-align: center">99.61 %</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Below is a graph reprenting the above results:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/testing_loss_and_accuracy.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 6: This shows the relationship of the loss and accuracy, while the model is being tested throughout the epochs.
+</div>
+
+<p>Based on the low loss and high accuracy the model performs fairly well.</p>
+
+<h2 id="making-some-predictions">Making Some Predictions</h2>
+
+<p>Now let us try to predict some genotypes.  We will take the following sets of read counts for different positions:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="text-align: center">Position</th>
+      <th style="text-align: center">Reference</th>
+      <th style="text-align: center">Alternate</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align: center">1</td>
+      <td style="text-align: center">10</td>
+      <td style="text-align: center">1</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">2</td>
+      <td style="text-align: center">10</td>
+      <td style="text-align: center">10</td>
+    </tr>
+    <tr>
+      <td style="text-align: center">3</td>
+      <td style="text-align: center">1</td>
+      <td style="text-align: center">10</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>We will need to take their fractions based on the total number of reads at each position, and then take the $log_2$ of each of those fractions:</p>
+
+<d-code block="" language="python">
+# The reads are of the form: [reference, alternate]
+# We will divide them by their total and take the log2 of each,
+# before we submit them to the model
+predition_reads_fractions = torch.log2(
+  torch.div( 
+    torch.tensor([[10,1], [10,10], [1,10]], dtype=torch.float32 ), 
+    torch.tensor([[10+1], [10+10], [1+10]], dtype=torch.float32 )
+  )
+)
+
+# The unprocessed predictions from the model
+prediction = shallow_variant_model( predition_reads_fractions ).detach()
+print( "The unprocessed predictions from the model: \n" )
+print( prediction )
+
+# The softmax transformations of the predictions to probabilities
+probability = nn.Softmax( dim=1 )( prediction )
+print( "\nThe softmax transformations of the predictions to probabilities: \n" )
+print( probability )
+
+# Checking that the probabilities add up to 1
+print( "\nChecking that the probabilities add up to 1: \n" )
+print( probability.sum( dim=1 ) )
+
+# The numeric genotype predictions
+print( "\nThe probability after argmax: \n" )
+classes = probability.argmax( dim=1 )
+print( classes )
+
+# The genotype of the numerically-transformed predictions
+print( "\nThe genotype of the numerically-transformed predictions: \n" )
+classes = probability.argmax( dim=1 )
+print( convert_numeric_class_to_genotype( classes ) )
+
+# The parameters of the trained model
+print( "\nThe parameters of the trained model:\n" )
+print( shallow_variant_model.state_dict() )
+</d-code>
+
+<p>The output result of the predictions is the following:</p>
+
+<d-code block="" language="python">
+The unprocessed predictions from the model: 
+
+tensor([[-40.8362,  19.1928,  16.7496,  -6.0768],
+        [-20.0807,   0.3643,   6.1820,  -5.4118],
+        [-35.6244, -17.7323,   4.2061,   7.6862]])
+
+The softmax transformations predictions to probabilities: 
+
+tensor([[7.8263e-27, 9.2006e-01, 7.9939e-02, 9.7584e-12],
+        [3.9171e-12, 2.9654e-03, 9.9703e-01, 9.1953e-06],
+        [1.5040e-19, 8.8650e-12, 2.9883e-02, 9.7012e-01]])
+
+Checking that the probabilities add up to 1: 
+
+tensor([1.0000, 1.0000, 1.0000])
+
+The numeric genotype predictions: 
+
+tensor([1, 2, 3])
+
+The genotype of the numerically-transformed predictions: 
+
+['0/0', '0/1', '1/1']
+</d-code>
+
+<p>The results seem promising and will always get better with more data and more rounds of training.</p>
+
+<p>One of the reasons I started this blog series is to unmystify what the models actually are performing internally.  In the next section we will dive a bit deeper on what the model actually learned from the read depths to predict the genotype.</p>
+
+<h2 id="what-has-the-model-learned-diving-deeper-into-the-genotype-model">What has the model learned? Diving Deeper Into the Genotype Model</h2>
+
+<p>PyTorch has made it easy to look inside the model to determine what the weights have learned from the data:</p>
+
+<d-code block="" language="python">
+
+# The parameters of the trained model
+print( "\nThe parameters of the trained model:\n" )
+print( shallow_variant_model.state_dict() )
+</d-code>
+
+<p>The result is the following:</p>
+
+<d-code block="" language="python">
+The parameters of the trained model:
+
+OrderedDict([('main.0.weight', tensor([[ 0.9628,  1.8207],
+        [ 0.1478,  0.9089],
+        [-1.2859, -3.0906],
+        [-2.5636,  0.2988],
+        [ 1.6635,  1.3060],
+        [ 1.4580,  1.6511]])), ('main.0.bias', tensor([-1.6755,  2.9028,  2.2591, -0.6324,  1.6223,  1.8639])), ('main.2.weight', tensor([[-0.9532,  1.7402, -3.2636, -2.2329,  1.6347,  1.9490],
+        [-0.8620, -2.1863,  1.5901, -2.7379, -2.1378, -1.5735],
+        [-1.4391, -0.5111,  1.3885, -0.3735, -2.3134, -1.8907],
+        [ 1.2431, -2.6779, -0.3130,  2.1911, -1.5693, -1.8159]])), ('main.2.bias', tensor([ 2.0075, -1.6815, -1.4783, -1.9677]))])
+</d-code>
+
+<p>Mathematically these can be represented as the following:</p>
+
+<h3 id="hidden-layer-i-hl1"><ins>Hidden Layer I (HL1)</ins></h3>
+
+\[\overrightarrow{\textbf{HL1}} = \begin{bmatrix}
+ 0.9628 &amp;  1.8207 \\
+ 0.1478 &amp;  0.9089 \\
+-1.2859 &amp; -3.0906 \\
+-2.5636 &amp;  0.2988 \\
+ 1.6635 &amp;  1.3060 \\
+ 1.4580 &amp;  1.6511
+\end{bmatrix} 
+\cdot
+\begin{bmatrix}
+log_2( \dfrac{reference}{total} ) \\
+log_2( \dfrac{alternate}{total} )
+\end{bmatrix} +\]
+
+\[+ \begin{bmatrix}
+-1.6755 \; 2.9028 \; 2.2591 \; -0.6324 \; 1.6223 \; 1.8639
+\end{bmatrix}\]
+
+<h3 id="hidden-layer-ii-hl2"><ins>Hidden Layer II (HL2)</ins></h3>
+
+\[\overrightarrow{\textbf{HL2}} = \begin{bmatrix}
+-0.9532 &amp;  1.7402 &amp; -3.2636 &amp; -2.2329 &amp;  1.6347 &amp;  1.9490 \\
+-0.8620 &amp; -2.1863 &amp;  1.5901 &amp; -2.7379 &amp; -2.1378 &amp; -1.5735 \\
+-1.4391 &amp; -0.5111 &amp;  1.3885 &amp; -0.3735 &amp; -2.3134 &amp; -1.8907 \\
+ 1.2431 &amp; -2.6779 &amp; -0.3130 &amp;  2.1911 &amp; -1.5693 &amp; -1.8159
+\end{bmatrix} 
+\cdot
+ReLU( \overrightarrow{\textbf{HL1}} ) +\]
+
+\[+ \begin{bmatrix}
+2.0075 &amp; -1.6815 &amp; -1.4783 &amp; -1.9677
+\end{bmatrix}\]
+
+<p>Let us now try to inspect the effect of the weights across the range of read fractions.  If we take a look at the outputs of <em>Hidden Layer I</em>, they are in the range from {$0.0001,…,0.9999$}.  The node output distribution (for Hidden Layer I) across that range is as follows:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/hiddel_layer_1_outputs.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 7: This shows the change in the outputs of Hidden Layer I for the range of possible inputs of read fractions.
+</div>
+
+<p>Another way the analysis can be viewed, is from the perspective of the binary contribution of the weights.  The inputs are $(p, 1-p)$ where $p \in $ {$0,…,1$}, as is $1-p$.  Thus given the log plot of the values, the highest contribution would be around $0.5$:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/log_p_vs_1_p.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 8: This shows the contributions of the weights among the two inputs based on the log-transformed values.
+</div>
+
+<p>Thus the <em>ReLU</em> activation function will remove any negative contributions for upcoming layers of network.  With that knowledge in mind, let’s explore which nodes actually have the most effect on predicting each genotype class:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/relu_activation_outputs.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 9: This shows the change in the outputs of the ReLU activation function, for the range of possible inputs of read fractions.
+</div>
+
+<p>Given the above graph, it seems that only the weights of nodes 2, 3, and 4 of Hidden Layer I actually will have significant inpact in the separation of genotypes.  With that knowledge, let’s explore the output of Hidden Layer II:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/hiddel_layer_2_outputs.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 10: This shows the change in the outputs of Hidden Layer II for the range of possible inputs of read fractions.
+</div>
+
+<p>Based on the separation of genotype classes, only classes $1$ $(0/0)$, $2$ $(0/1)$ and $3$ $(1/1)$ perform separation among each other.  Thus we can use class $1$ $(0/0)$ as a baseline to plot the other two against it, in order to determine separation of genotypes:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-11-04-shallowvariant/point_of_genotype_separation_among_classes.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 11: This shows the separation among genotype classes $2$ $(0/1)$ and $3$ $(1/1)$ with respect to class $1$ $(0/0)$.
+</div>
+
+<p>There is a clear point of intersection at around the value of $-14$ of class $1$ $(0/0)$, where a switch takes place among classes $2$ $(0/1)$ and $3$ $(1/1)$ $\text{–}$ emphasized by the weights.</p>
+
+<p>There is more analysis in the works, with which this report will be updated, but I hope I gave you a overview of what neural network models learn and how genotype can be predicted just from the read depth.</p>]]></content><author><name>Paul Grosu</name></author><category term="genomics" /><category term="machine-learning" /><category term="machine-learning" /><summary type="html"><![CDATA[This is a blog to illustrate the ideas of a neural network through a simplified variant caller named ShallowVariant.]]></summary></entry><entry><title type="html">What do models learn? (Part 1)</title><link href="https://pgrosu.github.io/blog/2023/wdml-part-1/" rel="alternate" type="text/html" title="What do models learn? (Part 1)" /><published>2023-10-18T12:12:00-04:00</published><updated>2023-10-18T12:12:00-04:00</updated><id>https://pgrosu.github.io/blog/2023/wdml-part-1</id><content type="html" xml:base="https://pgrosu.github.io/blog/2023/wdml-part-1/"><![CDATA[<p>Today’s machine learning and artificial intelligence (AI) domains dominate the landscape of many industries, where the question usually is <em>“what more can we do with data to accomplish some goal?”</em>, which is fed into a complex model to match against a specific pattern.  Such models are so well optimized with so many layers to focus them towards a specific patterned goal, that the internals are difficult to explain.  So when asked <em>“<ins>how does this model perform this goal, and what has it learned from the data</ins>“</em>, those questions are becoming more difficult to answer through clear and simple concepts.  Throughout this series of blogs I am hoping to uncover this for a wide audience – with any complex mathematics gently explained through simple analogies – as I keep running into these questions, but have not seen them well-presented without losing the reader through obscure, domain-specific terminology.  These topics will be divided into bite-size blogs, so as to not to overwhelm the reader or lose any audience members.  I will try to apply it to multiple fields as to make the material welcome to a variety of wide breadth of interested readers.  I will begin with a focus around the area of Deep Learning, which has become mysterious to many to explain precisely the meaning behind the effect of how they internally operate on the data to provide the given results.  With time I will expand to other areas of machine learning and artificial intelligence.</p>
+
+<h2 id="problem-state-representation-through-values">Problem State Representation Through Values</h2>
+
+<p>Most problems are easiest defined by the state they present themselves in.  The easist way to communicate that state is through values, and the connections among values.  The reason values present the best representation is because the analysis of values provides the best flexibility with our current domain knowledge towards insight of transforming problems towards solutions.  The simplest types of data types are either qualitative or quantitative, as shown in the table below:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/data_types.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 1: The different attributes in the types of data representation.  Such data would then be able to be processed a little bit more systematically via formal methods of calculation and transformation.
+</div>
+
+<p>As an example of a dataset to start with, let’s use the following simulated data of patients’ temperature and condition.  We will eventually build a model that will predict using temperature if they might be either sick or healthy.</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/patient_data.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 2: This is a simple example of simulated patient data to model the predicatability of patient health based on temperature.
+</div>
+
+<p>Assuming the data is <em>clean</em> – a topic I will cover at a later time – we can assume there is very little variability in the representation of the data and the reality of the true model the data captured.  One has to assume there is a model operating in nature that we inspect with our instruments, to capture the representation of its state in the form of values.  If there are minimal perturbations between the model and the instruments capturing its state, we assume the data contains minimal noise (error).  For now we will assume that in order to capture the larger concepts of a simple model.</p>
+
+<h2 id="identifying-state-separation-in-data">Identifying State Separation in Data</h2>
+
+<p>In our simple example, we simulated body temperature in trying to predict the state of patients (i.e. sick or healthy).  The simplest approach to start with is to plot the data, and see what trends might exist:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/example_data_patient_state.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 3: This is a plot of the patient data vs body temperature.  A clear trend separation exists.
+</div>
+
+<p>A clear nice vertical separation between the healthy and sick patients exists at a threshold value of 100° F:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/example_data_threshold.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 4: A clear threshold of 100° F patient data vs body temperature, giving a simple, clear trend separation between sick and healthy patients.
+</div>
+
+<p>Of course this is a very simple threshold that had chosed based on visual inspection, but it will help us with demonstrating the next step in the model.  More complex models will be presented later where a clear threshold will be a bit more difficult to select for.</p>
+
+<p>One thing that would make the separation a little easier to manage is to rescale the data between 0 and 1.  The simplest approach would be to divide the input values by 100 (or multiply by 1/100) and then substract 0.5.  Then the threshold value can be 0.5, and then we can label anything above 0.5 with a 1 (<i><b style="color:red">sick</b></i>), and anything below with 0 (<i><b style="color:green">healthy</b></i>).</p>
+
+<h2 id="the-mathematical-neuron-model-the-perceptron">The Mathematical Neuron Model: The Perceptron</h2>
+
+<p>Most models today apply a concept of <i>Deep Learning</i> upon data to learn similar to how our brains function.  The idea came from studying how our brains work.  The general concept is that we have at the core neurons, that receive an input signal and produce an output signal as follows:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/a_neuron.jpg" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 5: The neuron schematic as it operates in the brain.
+</div>
+
+<p>A neuron receives input signals from other connected neurons, and traverses the axon to generate an output signal.  Our brains have many layers of connected neurons to perform a decision or identify a pattern:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/neuron_layers.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 6: Neurons are organized into layers communicating in complex patters with each other to perform specific tasks.
+</div>
+
+<p>Given the above, a neuroscientist and a logician – namely Warren S. McCulloch and Walter Pitts – wrote a paper in 1943 called <em>“A logical calculus of the ideas immanent in nervous activity”</em> in the Bulletin of Mathematical Biophysics<d-cite key="mccullochpitts1943neuronmodel"></d-cite>.  They tried to mathematically model the workings of a neuron, which Frank Rosenblatt defined as a perceptron in his 1958 <em>Psychological Review</em> paper<d-cite key="rosenblatt1958perceptron"></d-cite>:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/the_perceptron.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 7: The perceptron defined based on the mathematical modeling of the neuron by McCulloch, Pitts and Rosenblatt.
+</div>
+
+<p>The idea is that the inputs (temperature) can be multiplied by adjusted weights and then summed up – via the <em><ins>adder function</ins></em> – such that based on a threshold (<em><ins>activation function</ins></em>) the output (sick or healthy) can be determined.  The mathematical representation of this would be as follows:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/the_perceptron_equation.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 8: The mathematical model of the perceptron, where the output would be run through a threshold function.  The last term (weight<sub>0</sub>) is usually called the bias term in order to fine-tune adjust the accuracy of the separation among the labels (sick vs healthy).
+</div>
+
+<p>The threshold function operates in our case by activating to the appropriate output based in the given input:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/threshold_function.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 9: The threshold function of activating according to the given input.
+</div>
+
+<p>The idea is that the inputs (temperature) can be multiplied by adjusted weights and then summed up – via the <em><ins>adder function</ins></em> – such that based on a threshold (<em><ins>activation function</ins></em>) the output (sick or healthy) can be determined.  The mathematical representation of this would be as follows:</p>
+
+<p>For our patient example, the perceptron model can be simplified to the following:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/the_perceptron_patient_example.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 10: The perceptron model of the patient example dataset.
+</div>
+
+<p>The above perceptron usually is presented in the following compacted form (which we will use from now on):</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/collapsed_perceptron.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 11: The compact form of the perceptron model for our patient example.
+</div>
+
+<p>The next question for extending our model to make it more useful would be to answer the following question: “<em>Should the patient be provided an aspirin regimen or not?</em>”.  This is based on the assumption that the model assumes this whole decision is based only on body temperature.  The way we can do this is to extend the model by a deeper layer with another perceptron:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/two_layer_network.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 11: A two layered neural network for extending the original perceptron with the discriminator for administering aspirin or not.  The weights for the second perceptron would be <i>w<sub>1</sub>=1</i> and <i>w<sub>0</sub>=0</i>.
+</div>
+
+<p>We have now created our first neural network – or simple deep neural network – but the question we still need to answer is, what did this neural network learn?  In short what these weights perform is the neuronal firing pattern to label across a <em><ins>decision boundary</ins></em> either <em>sick</em> or <em>healthy</em>.  This is driven by the pattern in the input data – thus the input data decides which neurons should fire, activating those weights.  But still, that feels confusing!</p>
+
+<p>If we look carefully at the behavior of these weights, they act as <i>vectors</i> – something I’ll cover later in greater detail – to rescale the space the data is represented in, in order to have a better separation criteria for selecting between the sick and healthy category (label) for each patient.  So <em>w<sub>1</sub>=1/100</em> re-adjusts all the values – together with the <i>bias</i> term (<em>w<sub>0</sub>=-0.5</em>) – to fall roughly between 0 and 1 by ensuring that values less than 100 fall below the 0.5 threshold, while anything above are over 0.5.  If you look carefully, the decision boundary of <em>Temperature=100</em> (or <em>x=0.5</em> after rescaling) is at a 90° (right angle) to the points:</p>
+
+<div class="row mt-3">
+    <div class="col-sm mt-3 mt-md-0">
+        <figure>
+
+  <picture>
+    
+
+    <!-- Fallback to the original file -->
+    <img src="/assets/img/posts/2023-10-18-wdml-part-1/decision_boundary_90_degrees.png" class="img-fluid rounded z-depth-1" width="auto" height="auto" onerror="this.onerror=null; $('.responsive-img-srcset').remove();" />
+  </picture>
+
+</figure>
+
+    </div>
+</div>
+<div class="caption">
+    Figure 12: The weight vectors of *w<sub>1</sub>=1/100* and *w<sub>0</sub>=-0.5* rescale and shift the temperature space (x-coordinate space).
+</div>
+
+<p>What this rescaling of the space actually does, sets the minimum input activation value (of 100° F) for activating the decision towards sickness.  If the input is below the threshold of 100° F, the perceptron is below the activation barrier of labeling the patient into the sick region of the space, thus remaining within the healthy region of the space.</p>
+
+<p>Thus a model in the most simple terms reshapes the data as a whole (in order to preserve its representation of reality) for properly finding discriminating lines for creating labeling boundaries.  These labeled boundaries then become the categories (labels) for classifying the input data into a decision about how to move forward based on this information.</p>
+
+<p>We will explore each of these ideas in greater depth in the upcoming blogs, but I hope this gives you a glimpse of what models actually learn about the data they are trained upon.</p>
+
+<!---
+## References
+
+1. W.S. McCulloch and W. Pitts. A logical calculus of ideas imminent in nervous activity.
+Bulletin of Mathematics Biophysics, 5:115–133, 1943.
+
+2. F. Rosenblatt. The Perceptron: A probabilistic model for information storage and
+organization in the brain. Psychological Review, 65(6):386–408, 1958.
+-->]]></content><author><name>Paul Grosu</name></author><category term="machine-learning" /><category term="machine-learning" /><summary type="html"><![CDATA[This is the first of a multi-part blog trying to dive a bit deeper regarding what machine learning models actually learn from the data that they are being trained on.]]></summary></entry></feed>
