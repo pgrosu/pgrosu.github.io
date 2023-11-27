@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><generator uri="https://jekyllrb.com/" version="4.3.2">Jekyll</generator><link href="https://pgrosu.github.io/feed.xml" rel="self" type="application/atom+xml" /><link href="https://pgrosu.github.io/" rel="alternate" type="text/html" hreflang="en" /><updated>2023-11-27T16:45:10-05:00</updated><id>https://pgrosu.github.io/feed.xml</id><title type="html">blank</title><subtitle>A little about me along with some deep dives to help others.
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><generator uri="https://jekyllrb.com/" version="4.3.2">Jekyll</generator><link href="https://pgrosu.github.io/feed.xml" rel="self" type="application/atom+xml" /><link href="https://pgrosu.github.io/" rel="alternate" type="text/html" hreflang="en" /><updated>2023-11-27T16:56:43-05:00</updated><id>https://pgrosu.github.io/feed.xml</id><title type="html">blank</title><subtitle>A little about me along with some deep dives to help others.
 </subtitle><entry><title type="html">ShallowConsensus</title><link href="https://pgrosu.github.io/blog/2023/shallowconsensus/" rel="alternate" type="text/html" title="ShallowConsensus" /><published>2023-11-14T10:12:00-05:00</published><updated>2023-11-14T10:12:00-05:00</updated><id>https://pgrosu.github.io/blog/2023/shallowconsensus</id><content type="html" xml:base="https://pgrosu.github.io/blog/2023/shallowconsensus/"><![CDATA[<p>In the previous <a href="../shallowvariant">blog</a> we applied the concepts of a neural network to genomics via a variant caller named ShallowVariant.  Here we will build a simpler variation of <a href="https://github.com/google/deepconsensus">Google’s DeepConsensus</a><d-cite key="baid2023deepconsensus"></d-cite> using an encoder-only transformer, to illustrate a practical example in the area of Genomics with Machine Learning.</p>
 
 <h2 id="our-goal">Our Goal</h2>
@@ -1195,7 +1195,7 @@ embedding_file.close()
     </div>
 </div>
 <div class="caption">
-    Figure 11: The distribution of subsequence frequencies across the genome.
+    Figure 11: The distribution of subsequence frequencies across the genome, along with an overlay of the interpolated (<i><b style="color:green">green</b></i>) trendline.
 </div>
 
 <p>We can begin to see that the most frequent subsequences are naturally biased towards the more shorter sequences, which confirms that the embedding is weighted via backpropagation more towards the longer, less frequent subsequences.  This naturally will shift the information towards the longer sequences, thus becoming more selective with predicting the next base, as supported by the highest attention for a given a subsequence.</p>
